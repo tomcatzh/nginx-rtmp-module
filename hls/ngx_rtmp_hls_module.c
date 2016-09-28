@@ -39,6 +39,8 @@ typedef struct {
     double                              duration;
     unsigned                            active:1;
     unsigned                            discont:1; /* before */
+
+    ngx_str_t                           random_prefix;
 } ngx_rtmp_hls_frag_t;
 
 
@@ -114,6 +116,8 @@ typedef struct {
     ngx_str_t                           key_path;
     ngx_str_t                           key_url;
     ngx_uint_t                          frags_per_key;
+    ngx_flag_t                          random_prefix;
+    ngx_uint_t                          random_prefix_length;
 } ngx_rtmp_hls_app_conf_t;
 
 
@@ -308,6 +312,20 @@ static ngx_command_t ngx_rtmp_hls_commands[] = {
       offsetof(ngx_rtmp_hls_app_conf_t, frags_per_key),
       NULL },
 
+    { ngx_string("hls_random_prefix"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, random_prefix),
+      NULL },
+
+    { ngx_string("hls_random_prefix_length"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, random_prefix_length),
+      NULL },
+
     ngx_null_command
 };
 
@@ -342,6 +360,23 @@ ngx_module_t  ngx_rtmp_hls_module = {
     NGX_MODULE_V1_PADDING
 };
 
+static u_char* randstring(u_char* p, u_char* randomString, size_t length) {
+    const char *string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    size_t stringLen = strlen(string);
+
+    if (length == 0) {
+        length = 1;
+    }
+
+    short key = 0;
+    size_t n;
+    for ( n = 0;n < length;n++) {
+        key = rand() % stringLen;
+        p[n] = randomString[n] = (u_char)string[key];
+    }
+
+    return p + length;
+}
 
 static ngx_rtmp_hls_frag_t *
 ngx_rtmp_hls_get_frag(ngx_rtmp_session_t *s, ngx_int_t n)
@@ -574,10 +609,18 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
 
         prev_key_id = f->key_id;
 
-        p = ngx_slprintf(p, end,
-                         "#EXTINF:%.3f,\n"
-                         "%V%V%s%uL.ts\n",
-                         f->duration, &hacf->base_url, &name_part, sep, f->id);
+        if (hacf->random_prefix) {
+            p = ngx_slprintf(p, end,
+                             "#EXTINF:%.3f,\n"
+                             "%V%V-%V%s%uL.ts\n",
+                             f->duration, &f->random_prefix, &hacf->base_url, &name_part, sep, f->id);
+        } else {
+            p = ngx_slprintf(p, end,
+                             "#EXTINF:%.3f,\n"
+                             "%V%V%s%uL.ts\n",
+                             f->duration, &hacf->base_url, &name_part, sep, f->id);  
+        }
+
 
         ngx_log_debug5(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                        "hls: fragment frag=%uL, n=%ui/%ui, duration=%.3f, "
@@ -850,6 +893,11 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
     ngx_rtmp_hls_ctx_t       *ctx;
     ngx_rtmp_hls_frag_t      *f;
     ngx_rtmp_hls_app_conf_t  *hacf;
+    size_t                    len;
+    u_char*                   p;
+    ngx_str_t                 randstr;
+
+    ngx_memzero(&randstr, sizeof(randstr));
 
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
 
@@ -876,7 +924,37 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
         id = (uint64_t) (id / g) * g;
     }
 
-    ngx_sprintf(ctx->stream.data + ctx->stream.len, "%uL.ts%Z", id);
+    if (hacf->random_prefix) {
+        len = hacf->path.len + 1 + hacf->random_prefix_length + 1 
+            + ctx->name.len + 1 + NGX_INT64_LEN + sizeof(".ts");
+
+        ctx->stream.data = ngx_palloc(s->connection->pool, len);
+
+        p = ngx_cpymem(ctx->stream.data, hacf->path.data, hacf->path.len);
+        if (p[-1] != '/') {
+            *p++ = '/';
+        }
+
+        randstr.len = hacf->random_prefix_length;
+        randstr.data = ngx_palloc(s->connection->pool, randstr.len + 1 );
+
+        if (hacf->nested) {
+            p = ngx_cpymem(p, ctx->name.data, ctx->name.len);
+            *p++ = '/';
+            p = randstring(p, randstr.data, hacf->random_prefix_length);
+            *p++ = '-';
+        } else {
+            p = randstring(p, randstr.data, hacf->random_prefix_length);
+            *p++ = '-';
+            p = ngx_cpymem(p, ctx->name.data, ctx->name.len);
+            *p++ = '-';
+        }
+        randstr.data[randstr.len] = '\0';
+
+        ngx_sprintf(p, "%uL.ts%Z", id);
+    } else {
+        ngx_sprintf(ctx->stream.data + ctx->stream.len, "%uL.ts%Z", id);
+    }
 
     if (hacf->keys) {
         if (ctx->key_frags == 0) {
@@ -960,6 +1038,9 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
     f->discont = discont;
     f->id = id;
     f->key_id = ctx->key_id;
+    if (hacf->random_prefix) {
+       f->random_prefix = randstr;
+    }
 
     ctx->frag_ts = ts;
 
@@ -1361,14 +1442,21 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
      * is allocated
      */
 
-    ctx->stream.len = p - ctx->playlist.data + 1;
-    ctx->stream.data = ngx_palloc(s->connection->pool,
-                                  ctx->stream.len + NGX_INT64_LEN +
-                                  sizeof(".ts"));
+    /*
+     * If not use random_prefix, use the original function for performance.
+    */
+    if (hacf->random_prefix) {
+        srand((ngx_pid << 16) ^ ((unsigned) ngx_time()));
+    } else {
+        ctx->stream.len = p - ctx->playlist.data + 1;
+        ctx->stream.data = ngx_palloc(s->connection->pool,
+                                      ctx->stream.len + NGX_INT64_LEN +
+                                      sizeof(".ts"));
 
-    ngx_memcpy(ctx->stream.data, ctx->playlist.data, ctx->stream.len - 1);
-    ctx->stream.data[ctx->stream.len - 1] = (hacf->nested ? '/' : '-');
-
+        ngx_memcpy(ctx->stream.data, ctx->playlist.data, ctx->stream.len - 1);
+        ctx->stream.data[ctx->stream.len - 1] = (hacf->nested ? '/' : '-');
+    }
+    
     /* varint playlist path */
 
     if (hacf->variant) {
@@ -2300,6 +2388,8 @@ ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf)
     conf->granularity = NGX_CONF_UNSET;
     conf->keys = NGX_CONF_UNSET;
     conf->frags_per_key = NGX_CONF_UNSET_UINT;
+    conf->random_prefix = NGX_CONF_UNSET;
+    conf->random_prefix_length = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -2338,6 +2428,8 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->key_path, prev->key_path, "");
     ngx_conf_merge_str_value(conf->key_url, prev->key_url, "");
     ngx_conf_merge_uint_value(conf->frags_per_key, prev->frags_per_key, 0);
+    ngx_conf_merge_value(conf->random_prefix, prev->random_prefix, 0);
+    ngx_conf_merge_uint_value(conf->random_prefix_length, prev->random_prefix_length, 10);
 
     if (conf->fraglen) {
         conf->winfrags = conf->playlen / conf->fraglen;
